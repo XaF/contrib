@@ -20,10 +20,19 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"time"
 
+	"github.com/golang/glog"
+
+	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/service/autoscaling"
 	"k8s.io/contrib/cluster-autoscaler/cloudprovider"
 	"k8s.io/contrib/cluster-autoscaler/config/dynamic"
 	apiv1 "k8s.io/kubernetes/pkg/api/v1"
+)
+
+const (
+	autoScalingGroupCacheExpire = 15 * time.Minute
 )
 
 // AwsCloudProvider implements CloudProvider interface.
@@ -105,6 +114,8 @@ type Asg struct {
 	AwsRef
 
 	awsManager *AwsManager
+	group *autoscaling.Group
+	groupExpire time.Time
 
 	minSize int
 	maxSize int
@@ -112,19 +123,20 @@ type Asg struct {
 
 // MaxSize returns maximum size of the node group.
 func (asg *Asg) MaxSize() int {
-	return asg.maxSize
+	return int(*asg.getGroup(false).MaxSize)
 }
 
 // MinSize returns minimum size of the node group.
 func (asg *Asg) MinSize() int {
-	return asg.minSize
+	return int(*asg.getGroup(false).MinSize)
 }
 
 // TargetSize returns the current TARGET size of the node group. It is possible that the
 // number is different from the number of nodes registered in Kuberentes.
 func (asg *Asg) TargetSize() (int, error) {
-	size, err := asg.awsManager.GetAsgSize(asg)
-	return int(size), err
+	// size, err := asg.awsManager.GetAsgSize(asg)
+	group, err := asg.getGroupWithErr(true)
+	return int(*group.DesiredCapacity), err
 }
 
 // IncreaseSize increases Asg size
@@ -132,14 +144,36 @@ func (asg *Asg) IncreaseSize(delta int) error {
 	if delta <= 0 {
 		return fmt.Errorf("size increase must be positive")
 	}
-	size, err := asg.awsManager.GetAsgSize(asg)
+	group, err := asg.getGroupWithErr(true)
 	if err != nil {
 		return err
 	}
+	size := *group.DesiredCapacity
+
 	if int(size)+delta > asg.MaxSize() {
 		return fmt.Errorf("size increase too large - desired:%d max:%d", int(size)+delta, asg.MaxSize())
 	}
-	return asg.awsManager.SetAsgSize(asg, size+int64(delta))
+
+	spot, err := asg.launchMultipleSpotInstances(delta)
+	if err != nil {
+		if spot > 0 {
+			return err
+		} else {
+			glog.Infoln("Error while launching spot (falling back to normal increase): %v\n", err)
+		}
+	}
+
+	// If we at least launched one spot
+	if spot > 0 {
+		glog.Infoln("Launched", spot, "spot(s) of", delta, "instance(s) requested")
+	}
+
+	// If there is more instances that need to be launched
+	if delta > spot {
+		glog.Infoln("Adding", (delta - spot), "on demand instance(s)")
+		err = asg.awsManager.SetAsgSize(asg, size+int64(delta))
+	}
+	return err
 }
 
 // DecreaseTargetSize decreases the target size of the node group. This function
@@ -225,6 +259,47 @@ func (asg *Asg) Debug() string {
 // Nodes returns a list of all nodes that belong to this node group.
 func (asg *Asg) Nodes() ([]string, error) {
 	return asg.awsManager.GetAsgNodes(asg)
+}
+
+func (asg *Asg) getGroupWithErr(forceRenew bool) (*autoscaling.Group, error) {
+	var err error = nil
+	if forceRenew || asg.groupExpire.Before(time.Now()) {
+		group, err := asg.getAutoScalingGroup()
+		if err == nil {
+			asg.group = group
+			asg.groupExpire = time.Now().Add(autoScalingGroupCacheExpire)
+		}
+	}
+	glog.V(8).Infoln("Group information will expire on", asg.groupExpire, "/ Current time:", time.Now())
+	return asg.group, err
+}
+
+func (asg *Asg) getGroup(forceRenew bool) *autoscaling.Group {
+	group, err := asg.getGroupWithErr(forceRenew)
+	if (err != nil) {
+		glog.Infoln("Error renewing auto scaling group information;",
+			"staying with old information for now:", err)
+	}
+	return group
+}
+
+func (asg *Asg) getAutoScalingGroup() (*autoscaling.Group, error) {
+	params := &autoscaling.DescribeAutoScalingGroupsInput{
+		AutoScalingGroupNames: []*string{
+			aws.String(asg.AwsRef.Name),
+		},
+	}
+
+	resp, err := asg.awsManager.service.DescribeAutoScalingGroups(params)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, group := range resp.AutoScalingGroups {
+		return group, nil
+	}
+
+	return nil, nil
 }
 
 func buildAsg(value string, awsManager *AwsManager) (*Asg, error) {

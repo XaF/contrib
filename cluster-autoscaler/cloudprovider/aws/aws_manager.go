@@ -27,6 +27,7 @@ import (
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/autoscaling"
+	"github.com/aws/aws-sdk-go/service/ec2"
 	"github.com/golang/glog"
 	"k8s.io/apimachinery/pkg/util/wait"
 	provider_aws "k8s.io/kubernetes/pkg/cloudprovider/providers/aws"
@@ -53,8 +54,10 @@ type AwsManager struct {
 	asgs     []*asgInformation
 	asgCache map[AwsRef]*Asg
 
-	service    autoScaling
-	cacheMutex sync.Mutex
+	service     autoScaling
+	autoscaling *autoscaling.AutoScaling
+	ec2         *ec2.EC2
+	cacheMutex  sync.Mutex
 }
 
 // CreateAwsManager constructs awsManager object.
@@ -67,11 +70,15 @@ func CreateAwsManager(configReader io.Reader) (*AwsManager, error) {
 		}
 	}
 
-	service := autoscaling.New(session.New())
+	sessioninst := session.Must(session.NewSession())
+	autoscalinginst := autoscaling.New(sessioninst)
+	ec2inst := ec2.New(sessioninst)
 	manager := &AwsManager{
-		asgs:     make([]*asgInformation, 0),
-		service:  service,
-		asgCache: make(map[AwsRef]*Asg),
+		asgs:        make([]*asgInformation, 0),
+		service:     autoscalinginst,
+		autoscaling: autoscalinginst,
+		ec2:         ec2inst,
+		asgCache:    make(map[AwsRef]*Asg),
 	}
 
 	go wait.Forever(func() {

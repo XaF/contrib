@@ -1,0 +1,38 @@
+apiVersion: extensions/v1beta1
+kind: Deployment
+metadata:
+  labels:
+    app: nginx-heavy
+  name: nginx-heavy
+  namespace: nginx-heavy
+spec:
+  replicas: 5
+  selector:
+    matchLabels:
+      app: nginx-heavy
+  strategy:
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 1
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: nginx-heavy
+    spec:
+      containers:
+      - image: nginx:latest
+        name: nginx
+        resources: {}
+        terminationMessagePath: /dev/termination-log
+        resources:
+          limits:
+            cpu: 900m
+            memory: 1024Mi
+          requests:
+            cpu: 900m
+            memory: 1024Mi
+      dnsPolicy: ClusterFirst
+      restartPolicy: Always
+      securityContext: {}
+      terminationGracePeriodSeconds: 30
